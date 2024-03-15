@@ -13,7 +13,7 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::Args;
 use nkeys::{KeyPair, KeyPairType};
 use serde::{Deserialize, Serialize};
@@ -343,6 +343,30 @@ pub fn labels_vec_to_hashmap(constraints: Vec<String>) -> Result<HashMap<String,
         };
     }
     Ok(hm)
+}
+
+/// This function is a simple helper to ensure that a component ID is a valid
+/// string containing only alphanumeric characters and underscores
+pub fn validate_component_id(id: &str) -> anyhow::Result<String> {
+    if id.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        Ok(id.to_string())
+    } else {
+        bail!("Component ID must contain only alphanumeric characters and underscores")
+    }
+}
+
+/// This function is a simple helper to ensure that a component ID is a valid
+/// by transforming any non-alphanumeric characters to underscores
+pub fn sanitize_component_id(id: &str) -> String {
+    id.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn determine_directory(directory: Option<PathBuf>) -> Result<PathBuf> {
