@@ -1303,7 +1303,10 @@ pub struct Host {
     /// NATS client to use for RPC calls
     rpc_nats: async_nats::Client,
     data: Store,
+    /// Task to watch for changes in the LATTICEDATA store
     data_watch: AbortHandle,
+    /// Task to watch for changes in the CONFIGDATA store
+    config_watch: AbortHandle,
     config_data: Store,
     config_generator: BundleGenerator,
     policy_manager: Arc<PolicyManager>,
@@ -1748,6 +1751,7 @@ impl Host {
         let (queue_abort, queue_abort_reg) = AbortHandle::new_pair();
         let (heartbeat_abort, heartbeat_abort_reg) = AbortHandle::new_pair();
         let (data_watch_abort, data_watch_abort_reg) = AbortHandle::new_pair();
+        let (config_watch_abort, config_watch_abort_reg) = AbortHandle::new_pair();
 
         let supplemental_config = if config.config_service_enabled {
             load_supplemental_config(&ctl_nats, &config.lattice, &labels).await?
@@ -1803,6 +1807,7 @@ impl Host {
             host_config: config,
             data: data.clone(),
             data_watch: data_watch_abort.clone(),
+            config_watch: config_watch_abort.clone(),
             config_data: config_data.clone(),
             config_generator,
             policy_manager,
@@ -1877,6 +1882,43 @@ impl Host {
                     info!("data watch task gracefully stopped");
                 } else {
                     error!("data watch task unexpectedly stopped");
+                }
+                Ok(())
+            }
+        });
+
+        let config_watch: JoinHandle<anyhow::Result<_>> = spawn({
+            let config_data = config_data.clone();
+            let host = Arc::clone(&host);
+            async move {
+                let config_data_watch = config_data
+                    .watch_all()
+                    .await
+                    .context("failed to watch lattice data bucket")?;
+                let mut config_watch = Abortable::new(config_data_watch, config_watch_abort_reg);
+                config_watch
+                    .by_ref()
+                    .for_each({
+                        let host = Arc::clone(&host);
+                        move |entry| {
+                            let host = Arc::clone(&host);
+                            async move {
+                                match entry {
+                                    Err(error) => {
+                                        error!("failed to watch config data bucket: {error}");
+                                    }
+                                    Ok(entry) => host.process_config_entry(entry).await,
+                                }
+                            }
+                        }
+                    })
+                    .await;
+                let deadline = { *host.stop_rx.borrow() };
+                host.stop_tx.send_replace(deadline);
+                if config_watch.is_aborted() {
+                    info!("config watch task gracefully stopped");
+                } else {
+                    error!("config watch task unexpectedly stopped");
                 }
                 Ok(())
             }
@@ -1969,8 +2011,10 @@ impl Host {
             heartbeat_abort.abort();
             queue_abort.abort();
             data_watch_abort.abort();
+            config_watch_abort.abort();
             host.policy_manager.policy_changes.abort();
-            let _ = try_join!(queue, data_watch, heartbeat).context("failed to await tasks")?;
+            let _ = try_join!(queue, data_watch, config_watch, heartbeat)
+                .context("failed to await tasks")?;
             host.publish_event(
                 "host_stopped",
                 json!({
@@ -2477,6 +2521,7 @@ impl Host {
 
         self.heartbeat.abort();
         self.data_watch.abort();
+        self.config_watch.abort();
         self.queue.abort();
         self.policy_manager.policy_changes.abort();
         let deadline =
@@ -4006,6 +4051,7 @@ impl Host {
 
     #[instrument(level = "trace", skip_all, fields(bucket = %entry.bucket, key = %entry.key, revision = %entry.revision, operation = ?entry.operation))]
     async fn process_config_entry(&self, entry: KvEntry) {
+        debug!(key = entry.key, "processing config entry");
         match entry.operation {
             Operation::Put => {
                 let data: HashMap<String, String> = match serde_json::from_slice(&entry.value) {
